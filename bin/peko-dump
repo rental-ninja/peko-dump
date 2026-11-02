@@ -1,18 +1,14 @@
 #!/usr/bin/env bash
-# Dumps a database with go-mydumper, uploads it as <name>.<yymmddHHMM>.tar.gz to every destination, then
-# prunes old dumps there. The profile says what to dump ([where], [select], [filter], threads, chunksize);
-# its [mysql] connection keys are replaced with the ones from the environment.
+# Dumps a database with MySQL Shell, uploads it as <name>.<yymmddHHMM>.tar.gz to every destination, then
+# prunes old dumps there. The profile says what to dump: [mysql] database, threads and chunksize (MB), and
+# [where], one row filter per table. The connection comes from the environment.
 set -euo pipefail
 umask 077
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MYDUMPER=${MYDUMPER:-$ROOT/build/go-mydumper/bin/mydumper}
+MYSQLSH=${MYSQLSH:-mysqlsh}
 WORK_DIR=${WORK_DIR:-$HOME/.peko-dump}
 DB_HOST=${DB_HOST:-127.0.0.1}
 DB_PORT=${DB_PORT:-3306}
-# A slow disk write must not make the server drop a streaming SELECT, nor a global max_execution_time kill it.
-DB_VARS=${DB_VARS:-charset=utf8mb4&net_write_timeout=3600&max_execution_time=0}
-DB_INIT_VARS=${DB_INIT_VARS:-$DB_VARS}
 MAX_NEWEST_AGE_HOURS=6
 LOCK_WAIT_SECONDS=21600
 
@@ -32,10 +28,8 @@ Usage: $(basename "$0") --profile <file.cnf> --name <name> --prefix backups/dail
 Environment:
   DB_USER, DB_PASSWORD   required
   DB_HOST, DB_PORT       default 127.0.0.1, 3306
-  DB_VARS                go-sql-driver DSN parameters, default ${DB_VARS}
-  DB_INIT_VARS           the same for the schema and table-list queries, default DB_VARS
   DESTINATIONS           required: space-separated <aws-profile>:<bucket>, e.g. "s3:<bucket> r2:<bucket>"
-  MYDUMPER               default build/go-mydumper/bin/mydumper (bin/install-mydumper)
+  MYSQLSH                default mysqlsh
   WORK_DIR               default ~/.peko-dump
 EOF
 }
@@ -60,6 +54,33 @@ fi
 : "${DB_USER:?DB_USER is required}"
 : "${DB_PASSWORD:?DB_PASSWORD is required}"
 : "${DESTINATIONS:?DESTINATIONS is required}"
+
+# Prints "key<TAB>value" for every key of one ini section; the value starts after the first = or :.
+section() {
+    awk -v wanted="$1" '
+        /^[[:space:]]*\[/ { name = $0; gsub(/[][[:space:]]/, "", name); next }
+        name != wanted || /^[[:space:]]*([#;]|$)/ { next }
+        {
+            split_at = match($0, /[=:]/)
+            key = substr($0, 1, split_at - 1); value = substr($0, split_at + 1)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", key); gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+            print key "\t" value
+        }
+    ' "$PROFILE"
+}
+setting() { section mysql | awk -F'\t' -v key="$1" '$1 == key && !found { print $2; found = 1 }'; }
+
+DATABASE=$(setting database)
+THREADS=$(setting threads)
+CHUNK_MB=$(setting chunksize)
+if [ -z "$DATABASE" ] || [[ ! "$THREADS" =~ ^[1-9][0-9]*$ || ! "$CHUNK_MB" =~ ^[1-9][0-9]*$ ]]; then
+    echo "${PROFILE} needs database, threads and chunksize under [mysql]" >&2
+    exit 1
+fi
+if [ -n "$(section select)" ]; then
+    echo "${PROFILE} has [select] lines: MySQL Shell can't replace column values, remove them" >&2
+    exit 1
+fi
 
 finish() {
     local rc=$?
@@ -86,26 +107,40 @@ RUN_DIR=$(mktemp -d "$WORK_DIR/run.XXXXXX")
 
 FILE="${NAME}.$(date -u +%y%m%d%H%M).tar.gz"
 TARBALL="$RUN_DIR/$FILE"
-CONFIG="$RUN_DIR/mydumper.cnf"
+DUMP_DIR="$RUN_DIR/dump"
 
-# go-mydumper reads only its ini file. The backticks make ini.v1 take the password raw, so # and ; in it
-# are not read as a comment.
-# shellcheck disable=SC2016
-PEKO_MYSQL=$(printf 'host = %s\nport = %s\nuser = %s\npassword = `%s`\noutdir = %s\nvars = %s\ninitvars = %s' \
-    "$DB_HOST" "$DB_PORT" "$DB_USER" "$DB_PASSWORD" "$RUN_DIR/dump" "$DB_VARS" "$DB_INIT_VARS") \
-    awk '
-        /^[[:space:]]*\[/ { section = $0; gsub(/[][[:space:]]/, "", section) }
-        section == "mysql" && /^[[:space:]]*(host|port|user|password|outdir|vars|initvars)[[:space:]]*[=:]/ { next }
-        { print }
-        /^[[:space:]]*\[mysql\][[:space:]]*$/ { print ENVIRON["PEKO_MYSQL"] }
-    ' "$PROFILE" >"$CONFIG"
+section where | jq -R -n \
+    --arg database "$DATABASE" --arg outdir "$DUMP_DIR" \
+    --argjson threads "$THREADS" --arg chunk "${CHUNK_MB}M" '
+    {
+        schemas: [$database],
+        outdir: $outdir,
+        options: {
+            threads: $threads,
+            bytesPerChunk: $chunk,
+            where: ([inputs | split("\t") | {key: ($database + "." + .[0]), value: .[1]}] | from_entries),
+            consistent: false,
+            events: false,
+            routines: false,
+            triggers: false,
+            showProgress: false
+        }
+    }' >"$RUN_DIR/dump.json"
+# Python, not JavaScript: Ubuntu's mysql-shell package is built without JavaScript.
+printf 'import json\njob = json.load(open(%s))\nutil.dump_schemas(job["schemas"], job["outdir"], job["options"])\n' \
+    "$(jq -n --arg path "$RUN_DIR/dump.json" '$path')" >"$RUN_DIR/dump.py"
 
-echo "Dumping ${DB_HOST}:${DB_PORT} with $(basename "$PROFILE")"
-"$MYDUMPER" -c "$CONFIG"
+echo "Dumping ${DB_HOST}:${DB_PORT}/${DATABASE} with $(basename "$PROFILE")"
+printf '%s\n' "$DB_PASSWORD" |
+    "$MYSQLSH" --host "$DB_HOST" --port "$DB_PORT" --user "$DB_USER" --passwords-from-stdin --py --file "$RUN_DIR/dump.py"
+if [ ! -f "$DUMP_DIR/@.done.json" ]; then
+    echo "MySQL Shell exited without finishing the dump (no @.done.json)" >&2
+    exit 1
+fi
 
-echo "Compressing ${FILE}"
-tar --use-compress-program=pigz -cf "$TARBALL" -C "$RUN_DIR/dump" .
-echo "Compressed to $(du -h "$TARBALL" | cut -f1)"
+echo "Packing ${FILE}"
+tar --use-compress-program=pigz -cf "$TARBALL" -C "$DUMP_DIR" .
+echo "Packed to $(du -h "$TARBALL" | cut -f1)"
 
 # Runs where set -e is off (its caller tests it), so every step that can fail returns explicitly.
 prune() {
