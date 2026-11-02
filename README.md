@@ -17,7 +17,7 @@ It runs from cron on the server that holds the replica.
    newest dump there isn't fresh. A failing destination doesn't stop the others; the run exits 1.
 5. Pings `--heartbeat` (healthchecks.io style) with `/start` once it holds the lock, then `/<exit status>`.
 
-A dump is not a point-in-time copy (`consistent: false`, so the dump user needs only `SELECT`). Use the
+A dump is not a point-in-time copy (`consistent: false`, so the dump user needs no lock privileges). Use the
 physical backup and the binlogs for disaster recovery.
 
 ## Profile
@@ -46,12 +46,17 @@ git clone https://github.com/rental-ninja/peko-dump.git /opt/peko-dump
 
 It also needs AWS CLI v2, 2.13 or later (earlier versions ignore `endpoint_url` in a profile).
 
-A MySQL user with `SELECT`, at `127.0.0.1` because MySQL Shell connects over TCP:
+A MySQL user at `127.0.0.1`, because MySQL Shell connects over TCP. Besides the database it reads the two
+role tables, to check its own privileges:
 
 ```sql
 CREATE USER 'dump'@'127.0.0.1' IDENTIFIED BY '<password>';
 GRANT SELECT ON <database>.* TO 'dump'@'127.0.0.1';
+GRANT SELECT ON mysql.role_edges TO 'dump'@'127.0.0.1';
+GRANT SELECT ON mysql.default_roles TO 'dump'@'127.0.0.1';
 ```
+
+Without `REPLICATION CLIENT` each dump warns that it can't record the binlog position; nothing needs it.
 
 One AWS CLI profile per destination, for the user that runs cron. Its key needs `s3:PutObject`,
 `s3:ListBucket` and `s3:DeleteObject` on the prefixes.
@@ -94,7 +99,7 @@ DESTINATIONS='s3:<bucket> r2:<bucket>'
 ```bash
 mkdir dump && tar -xzf <name>.<yymmddHHMM>.tar.gz -C dump
 mysql -e "SET GLOBAL local_infile = ON; ALTER INSTANCE DISABLE INNODB REDO_LOG"
-mysqlsh --host <host> --user <user> --js -e "util.loadDump('dump', {threads: 8, skipBinlog: true, ignoreVersion: true})"
+mysqlsh --host <host> --user <user> --py -e "util.load_dump('dump', {'threads': 8, 'skipBinlog': True, 'ignoreVersion': True})"
 mysql -e "ALTER INSTANCE ENABLE INNODB REDO_LOG; SET GLOBAL local_infile = OFF"
 ```
 
