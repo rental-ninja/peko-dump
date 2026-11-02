@@ -1,87 +1,90 @@
-# :package_description
+# peko-dump
 
-[![Latest Version on Packagist](https://img.shields.io/packagist/v/vendor_slug/package_slug.svg?style=flat-square)](https://packagist.org/packages/vendor_slug/package_slug)
-[![GitHub Tests Action Status](https://img.shields.io/github/workflow/status/vendor_slug/package_slug/run-tests?label=tests)](https://github.com/vendor_slug/package_slug/actions?query=workflow%3Arun-tests+branch%3Amain)
-[![GitHub Code Style Action Status](https://img.shields.io/github/workflow/status/vendor_slug/package_slug/Check%20&%20fix%20styling?label=code%20style)](https://github.com/vendor_slug/package_slug/actions?query=workflow%3A"Check+%26+fix+styling"+branch%3Amain)
-[![Total Downloads](https://img.shields.io/packagist/dt/vendor_slug/package_slug.svg?style=flat-square)](https://packagist.org/packages/vendor_slug/package_slug)
+Makes logical MySQL dumps in go-mydumper format and uploads them to one or more S3-compatible buckets
+(S3, R2). It runs from cron on the server that holds the replica.
 
----
-This repo can be used to scaffold a Laravel package. Follow these steps to get started:
+## What a run does
 
-1. Press the "Use template" button at the top of this repo to create a new repo with the contents of this skeleton
-2. Run "./configure-skeleton.sh" to run a script that will replace all placeholders throughout all the files
-3. Remove this block of text.
-4. Have fun creating your package.
-5. If you need help creating a package, consider picking up our <a href="https://laravelpackage.training">Laravel Package Training</a> video course.
----
+1. Takes the lock in `WORK_DIR` (waiting up to 6 hours for another run), then deletes what a killed run
+   left there.
+2. Copies the profile, replaces its `[mysql]` connection keys with `DB_*`, and dumps with go-mydumper.
+   Everything else comes from the profile: `[where]`, `[select]`, `[filter]`, threads, chunk size.
+3. Packs the dump as `<name>.<yymmddHHMM>.tar.gz` (UTC, files at the archive root).
+4. Uploads it to `<prefix><file>` on every destination. Then, on each destination that got it, deletes
+   the dumps older than `--keep-days` beyond the newest `--keep-at-least`, and refuses to prune when the
+   newest dump there isn't fresh. A failing destination doesn't stop the others; the run exits 1.
+5. Pings `--heartbeat` (healthchecks.io style) with `/start` once it holds the lock, then `/<exit status>`.
 
-This is where your description should go. Limit it to a paragraph or two. Consider adding a small example.
+Tables are read one by one with no shared snapshot, so a dump is not a point-in-time copy. Use the
+physical backup and the binlogs for disaster recovery.
 
-## Support us
-
-[<img src="https://github-ads.s3.eu-central-1.amazonaws.com/:package_name.jpg?t=1" width="419px" />](https://spatie.be/github-ad-click/:package_name)
-
-We invest a lot of resources into creating [best in class open source packages](https://spatie.be/open-source). You can support us by [buying one of our paid products](https://spatie.be/open-source/support-us).
-
-We highly appreciate you sending us a postcard from your hometown, mentioning which of our package(s) you are using. You'll find our address on [our contact page](https://spatie.be/about-us). We publish all received postcards on [our virtual postcard wall](https://spatie.be/open-source/postcards).
-
-## Installation
-
-You can install the package via composer:
+## Install (Ubuntu)
 
 ```bash
-composer require vendor_slug/package_slug
+sudo apt install git golang-go make pigz jq curl
+git clone https://github.com/rental-ninja/peko-dump.git /opt/peko-dump
+/opt/peko-dump/bin/install-mydumper
 ```
 
-You can publish and run the migrations with:
+`install-mydumper` builds go-mydumper at a pinned commit and applies `patches/`: unpatched, it exits 0
+when a SELECT dies mid-table, a file write fails, or a chunk ends on a table's last row, leaving a
+truncated table in a dump reported as good.
+
+It also needs AWS CLI v2, 2.13 or later (earlier versions ignore `endpoint_url` in a profile).
+
+A MySQL user with `SELECT`. go-mydumper connects over TCP, so its host is `127.0.0.1`, not `localhost`:
+
+```sql
+CREATE USER 'dump'@'127.0.0.1' IDENTIFIED BY '<password>';
+GRANT SELECT ON <database>.* TO 'dump'@'127.0.0.1';
+```
+
+One AWS CLI profile per destination, for the user that runs cron. Its key needs `s3:PutObject`,
+`s3:ListBucket` and `s3:DeleteObject` on the prefixes.
+
+```ini
+# ~/.aws/config (keys in ~/.aws/credentials)
+[profile s3]
+region = eu-west-1
+
+[profile r2]
+region = auto
+endpoint_url = https://<account-id>.r2.cloudflarestorage.com
+```
+
+The environment, in a file only that user can read (`chown <user> /etc/peko-dump.env`,
+`chmod 600 /etc/peko-dump.env`). cron runs it with `/bin/sh`, so single-quote every value:
 
 ```bash
-php artisan vendor:publish --provider="VendorName\Skeleton\SkeletonServiceProvider" --tag="package_slug-migrations"
-php artisan migrate
+PATH='/usr/local/bin:/usr/bin:/bin'
+DB_USER='dump'
+DB_PASSWORD='<password>'
+DESTINATIONS='s3:<bucket> r2:<bucket>'
+# Optional: DB_HOST, DB_PORT, DB_VARS, DB_INIT_VARS, MYDUMPER, WORK_DIR (bin/peko-dump --help)
 ```
 
-You can publish the config file with:
-```bash
-php artisan vendor:publish --provider="VendorName\Skeleton\SkeletonServiceProvider" --tag="package_slug-config"
+## Schedule
+
+```cron
+15 6 * * * set -a; . /etc/peko-dump.env; /opt/peko-dump/bin/peko-dump --profile <app>/daily_config.cnf --name <name> --prefix backups/daily/ --keep-days 120 --keep-at-least 30 --heartbeat https://hc-ping.com/<uuid> 2>&1 | logger -t peko-dump
 ```
 
-This is the contents of the published config file:
+- Keep the profiles in the application's repository and point `--profile` at its deployed checkout. A
+  migration that adds a generated column must add it to `[filter]` in the same change, or the dumps can't
+  be loaded (MySQL rejects values for generated columns).
+- Never change `--name` for a prefix: whatever loads the newest dump picks it by name, and pruning only
+  touches files with its own name.
+- A check that must pass before a dump goes first on the same line (`<check> && /opt/peko-dump/bin/peko-dump …`).
+  When it fails nothing is pinged, so the heartbeat alerts once its grace period ends.
 
-```php
-return [
-];
-```
-
-## Usage
-
-```php
-$skeleton = new VendorName\Skeleton();
-echo $skeleton->echoPhrase('Hello, Spatie!');
-```
-
-## Testing
+## Restore
 
 ```bash
-composer test
+mkdir dump && tar -xzf <name>.<yymmddHHMM>.tar.gz -C dump
+find dump -name '*.sql' ! -name '*schema-create*' -exec sed -i '1s/^/USE <database>;\n/' {} +
+build/go-mydumper/bin/myloader -h <host> -P 3306 -u <user> -p <password> -d dump -t 4 -o
 ```
 
-## Changelog
-
-Please see [CHANGELOG](CHANGELOG.md) for more information on what has changed recently.
-
-## Contributing
-
-Please see [CONTRIBUTING](.github/CONTRIBUTING.md) for details.
-
-## Security Vulnerabilities
-
-Please review [our security policy](../../security/policy) on how to report security vulnerabilities.
-
-## Credits
-
-- [:author_name](https://github.com/:author_username)
-- [All Contributors](../../contributors)
-
-## License
-
-The MIT License (MIT). Please see [License File](LICENSE.md) for more information.
+This myloader runs `USE` and the statements through a connection pool, so a statement can reach a new
+connection with no database selected. The `USE` line in every file makes that rare; if it still stops
+with "No database selected", rerun with `-t 1`.
