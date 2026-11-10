@@ -17,8 +17,29 @@ It runs from cron on the server that holds the replica.
    newest dump there isn't fresh. A failing destination doesn't stop the others; the run exits 1.
 5. Pings `--heartbeat` (healthchecks.io style) with `/start` once it holds the lock, then `/<exit status>`.
 
-A dump is not a point-in-time copy (`consistent: false`, so the dump user needs no lock privileges). Use the
-physical backup and the binlogs for disaster recovery.
+A dump is not a point-in-time copy (`consistent: false`, so the dump user needs no lock privileges). Use a
+snapshot (`--clone`, below) and the binlogs for disaster recovery.
+
+## Snapshot (`--clone`)
+
+With `--clone` instead of `--profile`, step 2 copies the whole instance with `CLONE LOCAL`: a physical copy of
+every table at one moment, taken without a global lock (DDL waits until it ends, writes don't). The archive is
+that data directory plus `peko-dump-clone.json`: when the copy began and ended, and the binlog that was current
+when it began (`CLONE LOCAL` itself records no binlog position).
+
+- It runs as root on the database server itself, with `DB_HOST=127.0.0.1`: mysqld writes the copy to its own
+  disk and the files belong to `mysql`.
+- `CLONE_DIR` (default `/var/lib/mysql-files`) must be a directory mysqld may write to; Ubuntu's AppArmor
+  profile allows that one. The run refuses to start unless that disk has twice the data's size free (the copy
+  plus its archive), and deletes the copy when it ends, also when it fails.
+- The clone plugin, and a user that may clone:
+
+```sql
+INSTALL PLUGIN clone SONAME 'mysql_clone.so';
+CREATE USER 'backup'@'127.0.0.1' IDENTIFIED BY '<password>';
+GRANT BACKUP_ADMIN, REPLICATION CLIENT ON *.* TO 'backup'@'127.0.0.1';
+GRANT SELECT ON performance_schema.clone_status TO 'backup'@'127.0.0.1';
+```
 
 ## Profile
 
@@ -105,3 +126,20 @@ mysql -e "ALTER INSTANCE ENABLE INNODB REDO_LOG; SET GLOBAL local_infile = OFF"
 
 With the redo log off the load is much faster, but a crash during it leaves an instance that won't start:
 only do it on a server you can rebuild.
+
+### Restore a snapshot
+
+On a server with the same MySQL version, MySQL stopped:
+
+```bash
+rm -rf /var/lib/mysql && mkdir /var/lib/mysql && tar -xzf <name>.<yymmddHHMM>.tar.gz -C /var/lib/mysql
+chown -R mysql:mysql /var/lib/mysql && systemctl start mysql
+```
+
+To roll it forward, replay the binlogs from `binlog_file_at_start` in `peko-dump-clone.json` up to the moment
+you want. With GTIDs on, the server skips the transactions the copy already holds:
+
+```bash
+mysqlbinlog --stop-datetime='<YYYY-MM-DD HH:MM:SS>' <binlog_file_at_start> <later binlogs…> | mysql --max-allowed-packet=1G
+```
+
