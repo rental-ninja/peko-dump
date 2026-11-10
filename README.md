@@ -1,87 +1,145 @@
-# :package_description
+# peko-dump
 
-[![Latest Version on Packagist](https://img.shields.io/packagist/v/vendor_slug/package_slug.svg?style=flat-square)](https://packagist.org/packages/vendor_slug/package_slug)
-[![GitHub Tests Action Status](https://img.shields.io/github/workflow/status/vendor_slug/package_slug/run-tests?label=tests)](https://github.com/vendor_slug/package_slug/actions?query=workflow%3Arun-tests+branch%3Amain)
-[![GitHub Code Style Action Status](https://img.shields.io/github/workflow/status/vendor_slug/package_slug/Check%20&%20fix%20styling?label=code%20style)](https://github.com/vendor_slug/package_slug/actions?query=workflow%3A"Check+%26+fix+styling"+branch%3Amain)
-[![Total Downloads](https://img.shields.io/packagist/dt/vendor_slug/package_slug.svg?style=flat-square)](https://packagist.org/packages/vendor_slug/package_slug)
+Makes logical MySQL dumps with MySQL Shell and uploads them to one or more S3-compatible buckets (S3, R2).
+It runs from cron on the server that holds the replica.
 
----
-This repo can be used to scaffold a Laravel package. Follow these steps to get started:
+## What a run does
 
-1. Press the "Use template" button at the top of this repo to create a new repo with the contents of this skeleton
-2. Run "./configure-skeleton.sh" to run a script that will replace all placeholders throughout all the files
-3. Remove this block of text.
-4. Have fun creating your package.
-5. If you need help creating a package, consider picking up our <a href="https://laravelpackage.training">Laravel Package Training</a> video course.
----
+1. Takes the lock in `WORK_DIR` (waiting up to 6 hours for another run), then deletes what a killed run
+   left there.
+2. Reads the profile and dumps the database with `util.dumpSchemas`: chunked and parallel, every chunk
+   compressed with zstd. Tables, their schema and generated columns come out as they are; only the rows
+   are filtered, by `[where]`.
+3. Checks the dump finished (`@.done.json`) and packs it as `<name>.<yymmddHHMM>.tar.gz` (UTC, files at the
+   archive root).
+4. Uploads it to `<prefix><file>` on every destination. Then, on each destination that got it, deletes
+   the dumps older than `--keep-days` beyond the newest `--keep-at-least`, and refuses to prune when the
+   newest dump there isn't fresh. A failing destination doesn't stop the others; the run exits 1.
+5. Pings `--heartbeat` (healthchecks.io style) with `/start` once it holds the lock, then `/<exit status>`.
 
-This is where your description should go. Limit it to a paragraph or two. Consider adding a small example.
+A dump is not a point-in-time copy (`consistent: false`, so the dump user needs no lock privileges). Use a
+snapshot (`--clone`, below) and the binlogs for disaster recovery.
 
-## Support us
+## Snapshot (`--clone`)
 
-[<img src="https://github-ads.s3.eu-central-1.amazonaws.com/:package_name.jpg?t=1" width="419px" />](https://spatie.be/github-ad-click/:package_name)
+With `--clone` instead of `--profile`, step 2 copies the whole instance with `CLONE LOCAL`: a physical copy of
+every table at one moment, taken without a global lock (DDL waits until it ends, writes don't). The archive is
+that data directory plus `peko-dump-clone.json`: when the copy began and ended, and the binlog that was current
+when it began (`CLONE LOCAL` itself records no binlog position).
 
-We invest a lot of resources into creating [best in class open source packages](https://spatie.be/open-source). You can support us by [buying one of our paid products](https://spatie.be/open-source/support-us).
+- It runs as root on the database server itself, with `DB_HOST=127.0.0.1`: mysqld writes the copy to its own
+  disk and the files belong to `mysql`.
+- `CLONE_DIR` (default `/var/lib/mysql-files`) must be a directory mysqld may write to; Ubuntu's AppArmor
+  profile allows that one. The run refuses to start unless that disk has twice the data's size free (the copy
+  plus its archive), and deletes the copy when it ends, also when it fails.
+- The clone plugin, and a user that may clone:
 
-We highly appreciate you sending us a postcard from your hometown, mentioning which of our package(s) you are using. You'll find our address on [our contact page](https://spatie.be/about-us). We publish all received postcards on [our virtual postcard wall](https://spatie.be/open-source/postcards).
+```sql
+INSTALL PLUGIN clone SONAME 'mysql_clone.so';
+CREATE USER 'backup'@'127.0.0.1' IDENTIFIED BY '<password>';
+GRANT BACKUP_ADMIN, REPLICATION CLIENT ON *.* TO 'backup'@'127.0.0.1';
+GRANT SELECT ON performance_schema.clone_status TO 'backup'@'127.0.0.1';
+```
 
-## Installation
+## Profile
 
-You can install the package via composer:
+An ini file:
+
+```ini
+[mysql]
+database = <database>
+threads = 10
+chunksize = 64          # MB per chunk
+
+[where]
+<table> = <SQL condition>   # only the rows that match; a table without a line is dumped whole
+```
+
+Other sections are ignored, except `[select]`: MySQL Shell can't replace column values, so a profile that
+asks for it is refused.
+
+## Install (Ubuntu)
 
 ```bash
-composer require vendor_slug/package_slug
+sudo apt install mysql-shell pigz jq curl
+git clone https://github.com/rental-ninja/peko-dump.git /opt/peko-dump
 ```
 
-You can publish and run the migrations with:
+It also needs AWS CLI v2, 2.13 or later (earlier versions ignore `endpoint_url` in a profile).
+
+A MySQL user at `127.0.0.1`, because MySQL Shell connects over TCP. Besides the database it reads the two
+role tables, to check its own privileges:
+
+```sql
+CREATE USER 'dump'@'127.0.0.1' IDENTIFIED BY '<password>';
+GRANT SELECT ON <database>.* TO 'dump'@'127.0.0.1';
+GRANT SELECT ON mysql.role_edges TO 'dump'@'127.0.0.1';
+GRANT SELECT ON mysql.default_roles TO 'dump'@'127.0.0.1';
+```
+
+Without `REPLICATION CLIENT` each dump warns that it can't record the binlog position; nothing needs it.
+
+One AWS CLI profile per destination, for the user that runs cron. Its key needs `s3:PutObject`,
+`s3:ListBucket` and `s3:DeleteObject` on the prefixes.
+
+```ini
+# ~/.aws/config (keys in ~/.aws/credentials)
+[profile s3]
+region = eu-west-1
+
+[profile r2]
+region = auto
+endpoint_url = https://<account-id>.r2.cloudflarestorage.com
+```
+
+The environment, in a file only that user can read (`chown <user> /etc/peko-dump.env`,
+`chmod 600 /etc/peko-dump.env`). cron runs it with `/bin/sh`, so single-quote every value:
 
 ```bash
-php artisan vendor:publish --provider="VendorName\Skeleton\SkeletonServiceProvider" --tag="package_slug-migrations"
-php artisan migrate
+PATH='/usr/local/bin:/usr/bin:/bin'
+DB_USER='dump'
+DB_PASSWORD='<password>'
+DESTINATIONS='s3:<bucket> r2:<bucket>'
+# Optional: DB_HOST, DB_PORT, MYSQLSH, WORK_DIR (bin/peko-dump --help)
 ```
 
-You can publish the config file with:
-```bash
-php artisan vendor:publish --provider="VendorName\Skeleton\SkeletonServiceProvider" --tag="package_slug-config"
+## Schedule
+
+```cron
+15 6 * * * set -a; . /etc/peko-dump.env; /opt/peko-dump/bin/peko-dump --profile <app>/daily_config.cnf --name <name> --prefix backups/daily/ --keep-days 120 --keep-at-least 30 --heartbeat https://hc-ping.com/<uuid> 2>&1 | logger -t peko-dump
 ```
 
-This is the contents of the published config file:
+- Keep the profiles in the application's repository and point `--profile` at its deployed checkout.
+- Never change `--name` for a prefix: whatever loads the newest dump picks it by name, and pruning only
+  touches files with its own name.
+- A check that must pass before a dump goes first on the same line (`<check> && /opt/peko-dump/bin/peko-dump …`).
+  When it fails nothing is pinged, so the heartbeat alerts once its grace period ends.
 
-```php
-return [
-];
-```
-
-## Usage
-
-```php
-$skeleton = new VendorName\Skeleton();
-echo $skeleton->echoPhrase('Hello, Spatie!');
-```
-
-## Testing
+## Restore
 
 ```bash
-composer test
+mkdir dump && tar -xzf <name>.<yymmddHHMM>.tar.gz -C dump
+mysql -e "SET GLOBAL local_infile = ON; ALTER INSTANCE DISABLE INNODB REDO_LOG"
+mysqlsh --host <host> --user <user> --py -e "util.load_dump('dump', {'threads': 8, 'skipBinlog': True, 'ignoreVersion': True})"
+mysql -e "ALTER INSTANCE ENABLE INNODB REDO_LOG; SET GLOBAL local_infile = OFF"
 ```
 
-## Changelog
+With the redo log off the load is much faster, but a crash during it leaves an instance that won't start:
+only do it on a server you can rebuild.
 
-Please see [CHANGELOG](CHANGELOG.md) for more information on what has changed recently.
+### Restore a snapshot
 
-## Contributing
+On a server with the same MySQL version, MySQL stopped:
 
-Please see [CONTRIBUTING](.github/CONTRIBUTING.md) for details.
+```bash
+rm -rf /var/lib/mysql && mkdir /var/lib/mysql && tar -xzf <name>.<yymmddHHMM>.tar.gz -C /var/lib/mysql
+chown -R mysql:mysql /var/lib/mysql && systemctl start mysql
+```
 
-## Security Vulnerabilities
+To roll it forward, replay the binlogs from `binlog_file_at_start` in `peko-dump-clone.json` up to the moment
+you want. With GTIDs on, the server skips the transactions the copy already holds:
 
-Please review [our security policy](../../security/policy) on how to report security vulnerabilities.
+```bash
+mysqlbinlog --stop-datetime='<YYYY-MM-DD HH:MM:SS>' <binlog_file_at_start> <later binlogs…> | mysql --max-allowed-packet=1G
+```
 
-## Credits
-
-- [:author_name](https://github.com/:author_username)
-- [All Contributors](../../contributors)
-
-## License
-
-The MIT License (MIT). Please see [License File](LICENSE.md) for more information.
