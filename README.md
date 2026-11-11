@@ -92,8 +92,9 @@ One AWS CLI profile per destination, for the user that runs cron. Its key needs 
 region = eu-west-1
 
 [profile r2]
+# A bucket in the EU jurisdiction answers only on https://<account-id>.eu.r2.cloudflarestorage.com
 region = auto
-endpoint_url = https://<account-id>.r2.cloudflarestorage.com   # an EU bucket: <account-id>.eu.r2…
+endpoint_url = https://<account-id>.r2.cloudflarestorage.com
 ```
 
 The environment, in a file only that user can read (`chown <user> /etc/peko-dump.env`,
