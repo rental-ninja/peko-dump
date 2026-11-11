@@ -11,10 +11,14 @@ It runs from cron on the server that holds the replica.
    compressed with zstd. Tables, their schema and generated columns come out as they are; only the rows
    are filtered, by `[where]`.
 3. Checks the dump finished (`@.done.json`) and packs it as `<name>.<yymmddHHMM>.tar.gz` (UTC, files at the
-   archive root).
+   archive root). With `--recipient age1…` (repeatable), the archive goes through age on its way to the
+   disk and is named `<name>.<yymmddHHMM>.tar.gz.age`: the buckets only ever get ciphertext, and only the
+   matching age identity opens it. The dump itself is plaintext in `WORK_DIR` while the run lasts.
 4. Uploads it to `<prefix><file>` on every destination. Then, on each destination that got it, deletes
    the dumps older than `--keep-days` beyond the newest `--keep-at-least`, and refuses to prune when the
    newest dump there isn't fresh. A failing destination doesn't stop the others; the run exits 1.
+   Pruning counts both names. A bucket lock (R2) that still protects a dump to prune fails the run, so
+   keep each lock shorter than `--keep-days`.
 5. Pings `--heartbeat` (healthchecks.io style) with `/start` once it holds the lock, then `/<exit status>`.
 
 A dump is not a point-in-time copy (`consistent: false`, so the dump user needs no lock privileges). Use a
@@ -61,7 +65,7 @@ asks for it is refused.
 ## Install (Ubuntu)
 
 ```bash
-sudo apt install mysql-shell pigz jq curl
+sudo apt install mysql-shell pigz jq curl age   # age only for --recipient
 git clone https://github.com/rental-ninja/peko-dump.git /opt/peko-dump
 ```
 
@@ -88,6 +92,7 @@ One AWS CLI profile per destination, for the user that runs cron. Its key needs 
 region = eu-west-1
 
 [profile r2]
+# A bucket in the EU jurisdiction answers only on https://<account-id>.eu.r2.cloudflarestorage.com
 region = auto
 endpoint_url = https://<account-id>.r2.cloudflarestorage.com
 ```
@@ -119,6 +124,7 @@ DESTINATIONS='s3:<bucket> r2:<bucket>'
 
 ```bash
 mkdir dump && tar -xzf <name>.<yymmddHHMM>.tar.gz -C dump
+# encrypted: age -d -i <identity file> <name>.<yymmddHHMM>.tar.gz.age | tar -xz -C dump
 mysql -e "SET GLOBAL local_infile = ON; ALTER INSTANCE DISABLE INNODB REDO_LOG"
 mysqlsh --host <host> --user <user> --py -e "util.load_dump('dump', {'threads': 8, 'skipBinlog': True, 'ignoreVersion': True})"
 mysql -e "ALTER INSTANCE ENABLE INNODB REDO_LOG; SET GLOBAL local_infile = OFF"
@@ -143,3 +149,9 @@ you want. With GTIDs on, the server skips the transactions the copy already hold
 mysqlbinlog --stop-datetime='<YYYY-MM-DD HH:MM:SS>' <binlog_file_at_start> <later binlogs…> | mysql --max-allowed-packet=1G
 ```
 
+
+## Test
+
+```bash
+docker run --rm -v "$PWD:/peko:ro" ubuntu:24.04 bash /peko/test/run.sh
+```
