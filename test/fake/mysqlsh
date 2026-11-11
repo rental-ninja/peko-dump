@@ -1,0 +1,5 @@
+#!/bin/bash
+# Stand-in for MySQL Shell: writes a finished dump where dump.json says.
+while [ $# -gt 0 ]; do [ "$1" = --file ] && py=$2; shift; done
+out=$(jq -r .outdir "$(dirname "$py")/dump.json")
+mkdir -p "$out" && echo '{}' >"$out/@.done.json" && echo rows >"$out/ninja@t@0.tsv.zst"

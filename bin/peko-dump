@@ -3,6 +3,7 @@
 # prunes old dumps there. The profile says what to dump: [mysql] database, threads and chunksize (MB), and
 # [where], one row filter per table. The connection comes from the environment.
 # With --clone it packs a physical, consistent copy of the whole instance (CLONE LOCAL) instead of a dump.
+# With --recipient the archive is encrypted with age before it leaves the server, as <file>.tar.gz.age.
 set -euo pipefail
 umask 077
 
@@ -21,17 +22,19 @@ PREFIX=""
 KEEP_DAYS=""
 KEEP_AT_LEAST=""
 HEARTBEAT=""
+RECIPIENTS=()
 RUN_DIR=""
 CLONE_TARGET=""
 
 usage() {
     cat <<EOF
 Usage: $(basename "$0") --profile <file.cnf> --name <name> --prefix backups/daily/
-       --keep-days 120 --keep-at-least 30 [--heartbeat https://hc-ping.com/<uuid>]
+       --keep-days 120 --keep-at-least 30 [--heartbeat https://hc-ping.com/<uuid>] [--recipient age1…]
        $(basename "$0") --clone --name <name> --prefix snapshots/
-       --keep-days 14 --keep-at-least 7 [--heartbeat https://hc-ping.com/<uuid>]
+       --keep-days 14 --keep-at-least 7 [--heartbeat https://hc-ping.com/<uuid>] [--recipient age1…]
 
 --clone copies the whole instance with CLONE LOCAL: run it as root on the database server itself.
+--recipient encrypts the archive with age to that public key; repeat it for more keys. Needs age.
 
 Environment:
   DB_USER, DB_PASSWORD   required
@@ -52,6 +55,7 @@ while [ $# -gt 0 ]; do
         --keep-days) KEEP_DAYS="$2"; shift 2 ;;
         --keep-at-least) KEEP_AT_LEAST="$2"; shift 2 ;;
         --heartbeat) HEARTBEAT="$2"; shift 2 ;;
+        --recipient) RECIPIENTS+=("$2"); shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown argument: $1" >&2; usage >&2; exit 1 ;;
     esac
@@ -64,6 +68,16 @@ fi
 : "${DB_USER:?DB_USER is required}"
 : "${DB_PASSWORD:?DB_PASSWORD is required}"
 : "${DESTINATIONS:?DESTINATIONS is required}"
+for recipient in ${RECIPIENTS[@]+"${RECIPIENTS[@]}"}; do
+    if [[ ! "$recipient" =~ ^age1[02-9ac-hj-np-z]+$ ]]; then
+        echo "--recipient takes an age public key (age1…), not ${recipient:0:12}…" >&2
+        exit 1
+    fi
+done
+if [ ${#RECIPIENTS[@]} -gt 0 ] && ! command -v age >/dev/null; then
+    echo "--recipient needs age: apt install age" >&2
+    exit 1
+fi
 
 # Prints "key<TAB>value" for every key of one ini section; the value starts after the first = or :.
 section() {
@@ -127,6 +141,7 @@ rm -rf "$WORK_DIR"/run.*
 RUN_DIR=$(mktemp -d "$WORK_DIR/run.XXXXXX")
 
 FILE="${NAME}.$(date -u +%y%m%d%H%M).tar.gz"
+[ ${#RECIPIENTS[@]} -eq 0 ] || FILE="${FILE}.age"
 TARBALL="$RUN_DIR/$FILE"
 DUMP_DIR="$RUN_DIR/dump"
 
@@ -213,7 +228,14 @@ make_clone() {
 if [ "$CLONE" -eq 1 ]; then make_clone; else make_dump; fi
 
 echo "Packing ${FILE}"
-tar --use-compress-program=pigz -cf "$TARBALL" -C "$DUMP_DIR" .
+if [ ${#RECIPIENTS[@]} -eq 0 ]; then
+    tar --use-compress-program=pigz -cf "$TARBALL" -C "$DUMP_DIR" .
+else
+    # Piped, so the unencrypted archive never touches the disk.
+    age_args=()
+    for recipient in "${RECIPIENTS[@]}"; do age_args+=(-r "$recipient"); done
+    tar -cf - -C "$DUMP_DIR" . | pigz | age "${age_args[@]}" -o "$TARBALL"
+fi
 echo "Packed to $(du -h "$TARBALL" | cut -f1)"
 
 # Runs where set -e is off (its caller tests it), so every step that can fail returns explicitly.
@@ -222,7 +244,7 @@ prune() {
     listing=$(aws --profile "$profile" s3api list-objects-v2 --bucket "$bucket" --prefix "$PREFIX" --output json) || return 1
     selection=$(jq -c \
         --arg prefix "$PREFIX" \
-        --arg pattern "^${NAME}\\.[0-9]{10}\\.tar\\.gz$" \
+        --arg pattern "^${NAME}\\.[0-9]{10}\\.tar\\.gz(\\.age)?$" \
         --argjson now "$(date -u +%s)" \
         --argjson keep "$KEEP_AT_LEAST" \
         --argjson maxAgeDays "$KEEP_DAYS" '

@@ -1,0 +1,16 @@
+#!/bin/bash
+# Stand-in for the AWS CLI on a local "bucket" under /buckets.
+[ "$1" = --profile ] && shift 2
+cmd="$1 $2"; shift 2
+get() { local k=$1; shift; while [ $# -gt 0 ]; do [ "$1" = "$k" ] && { echo "$2"; return; }; shift; done; }
+case "$cmd" in
+  "s3 cp") args=("$@"); src=${args[-2]}; dst=${args[-1]#s3://}; mkdir -p "/buckets/$(dirname "$dst")"; cp "$src" "/buckets/$dst" ;;
+  "s3api list-objects-v2") b=$(get --bucket "$@"); p=$(get --prefix "$@")
+    find "/buckets/$b/$p" -type f 2>/dev/null | while read -r f; do
+      jq -n --arg k "${f#/buckets/$b/}" --arg m "$(date -u -d "@$(stat -c %Y "$f")" +%Y-%m-%dT%H:%M:%S+00:00)" '{Key: $k, LastModified: $m}'
+    done | jq -s '{Contents: .}' ;;
+  "s3api delete-objects") b=$(get --bucket "$@"); d=$(get --delete "$@")
+    if [ -n "${FAIL_DELETE:-}" ]; then jq -n --argjson d "$d" '{Errors: [$d.Objects[] | {Key, Code: "ObjectLockedByBucketPolicy"}]}'; exit 0; fi
+    jq -r '.Objects[].Key' <<<"$d" | while read -r k; do rm "/buckets/$b/$k"; done; echo '{}' ;;
+  *) echo "fake aws: unsupported $cmd" >&2; exit 2 ;;
+esac
