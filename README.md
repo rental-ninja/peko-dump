@@ -12,8 +12,8 @@ It runs from cron on the server that holds the replica.
    are filtered, by `[where]`.
 3. Checks the dump finished (`@.done.json`) and packs it as `<name>.<yymmddHHMM>.tar.gz` (UTC, files at the
    archive root). With `--recipient age1…` (repeatable), the archive goes through age on its way to the
-   disk and is named `<name>.<yymmddHHMM>.tar.gz.age`: the server and the buckets only ever hold ciphertext,
-   and only the matching age identity can open it.
+   disk and is named `<name>.<yymmddHHMM>.tar.gz.age`: the buckets only ever get ciphertext, and only the
+   matching age identity opens it. The dump itself is plaintext in `WORK_DIR` while the run lasts.
 4. Uploads it to `<prefix><file>` on every destination. Then, on each destination that got it, deletes
    the dumps older than `--keep-days` beyond the newest `--keep-at-least`, and refuses to prune when the
    newest dump there isn't fresh. A failing destination doesn't stop the others; the run exits 1.

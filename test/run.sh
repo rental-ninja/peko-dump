@@ -22,6 +22,7 @@ check "decrypts and lists @.done.json" 'age -d -i /tmp/id.txt "/buckets/b/backup
 check "prune removed the .tar.gz and .tar.gz.age past 120 days, kept the rest" '[ "$(ls /buckets/b/backups/daily | wc -l)" -eq 3 ] && ! ls /buckets/b/backups/daily | grep -q "$(date -u -d "150 days ago" +%y%m%d)"'
 check "no plaintext archive left in work dir" '! find /tmp/work -name "*.tar.gz" | grep -q .'
 $P "${A[@]}" --recipient AGE-SECRET-KEY-1ABC >/tmp/bad.log 2>&1; check "rejects a non-public key" '[ $? -eq 1 ] && grep -q "AGE-SECRET-" /tmp/bad.log && ! grep -q "1ABC" /tmp/bad.log'
+$P "${A[@]}" --recipient "${R%?}$([ "${R: -1}" = q ] && echo p || echo q)" >/tmp/typo.log 2>&1; check "rejects a mistyped key before dumping" '[ $? -eq 1 ] && ! grep -q Dumping /tmp/typo.log'
 f=/buckets/b/backups/daily/ninja.$(date -u -d '130 days ago' +%y%m%d%H%M).tar.gz.age; echo old >"$f"; touch -d '130 days ago' "$f"; sleep 61
 FAIL_DELETE=1 $P "${A[@]}" --recipient "$R" >/tmp/lock.log 2>&1; check "locked delete fails the run" '[ $? -eq 1 ] && grep -q ObjectLockedByBucketPolicy /tmp/lock.log'
 echo "passed=$pass failed=$fail"; [ $fail -eq 0 ]

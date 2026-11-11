@@ -68,16 +68,17 @@ fi
 : "${DB_USER:?DB_USER is required}"
 : "${DB_PASSWORD:?DB_PASSWORD is required}"
 : "${DESTINATIONS:?DESTINATIONS is required}"
-for recipient in ${RECIPIENTS[@]+"${RECIPIENTS[@]}"}; do
-    if [[ ! "$recipient" =~ ^age1[02-9ac-hj-np-z]+$ ]]; then
-        echo "--recipient takes an age public key (age1…), not ${recipient:0:12}…" >&2
-        exit 1
-    fi
-done
 if [ ${#RECIPIENTS[@]} -gt 0 ] && ! command -v age >/dev/null; then
     echo "--recipient needs age: apt install age" >&2
     exit 1
 fi
+# Checked before the dump, which can take an hour: age itself must accept every key.
+for recipient in ${RECIPIENTS[@]+"${RECIPIENTS[@]}"}; do
+    if [[ ! "$recipient" =~ ^age1[02-9ac-hj-np-z]+$ ]] || ! age -r "$recipient" </dev/null >/dev/null 2>&1; then
+        echo "--recipient takes an age public key (age1…), not ${recipient:0:12}…" >&2
+        exit 1
+    fi
+done
 
 # Prints "key<TAB>value" for every key of one ini section; the value starts after the first = or :.
 section() {
